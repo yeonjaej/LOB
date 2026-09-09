@@ -40,6 +40,7 @@ def build_market_config(
     start_time: str = "09:30:00",
     end_time: str = "16:00:00",
     fund_r_bar: int = 58_500,  # fundamental value in CENTS; ~$585.00, AAPL's Part-1 level
+    fund_vol: float = 1.2e-4,  # see docstring: recalibrated from rmsc03.py's 1e-3
     fundamental_series: Optional[pd.Series] = None,
     num_noise_agents: int = 5000,
     num_value_agents: int = 100,
@@ -47,6 +48,7 @@ def build_market_config(
     num_mm_agents: int = 2,
     log_orders: bool = True,
     book_log_depth: int = 10,
+    noise_warmup: str = "30min",
     exec_agent_builder: Optional[Callable[[int], object]] = None,
 ) -> dict:
     """`fundamental_series`, if given, replaces ABIDES's generic synthetic
@@ -57,6 +59,18 @@ def build_market_config(
     random walk whose volatility/megashock parameters were never calibrated to AAPL
     (see the Part 3b caveats: that mismatch is what produced session-long drift an
     order of magnitude larger than AAPL's real ~1.3% move).
+
+    `fund_vol` (only used on the synthetic path, i.e. when `fundamental_series` is
+    None): the OU fundamental process's diffusion variance scales as
+    `fund_vol**2 * elapsed_ns`. At `rmsc03.py`'s original 1e-3 (never recalibrated
+    for this project's price level/session length), a 45-min window's fundamental
+    alone has std ~$16.43 -- a ~2.8% swing from diffusion before any order-flow
+    amplification, versus Part 1's real AAPL day moving only ~1.3% over the *entire*
+    6.5-hour session. 1.2e-4 targets ~$1.75-$2.93 (0.3-0.5%) of fundamental-only
+    movement over a 45-min window, scaling Part 1's realized move by sqrt(45/390).
+    This was the dominant driver of Part 10's K=30 noise floor and several outlier
+    seeds (e.g. +284, +358 bps) -- fixing the reward function's drift-sensitivity
+    was fighting a symptom of this, not the cause.
     """
     np.random.seed(seed)
 
@@ -76,7 +90,7 @@ def build_market_config(
                 "r_bar": fund_r_bar,
                 "kappa": 1.67e-16,
                 "sigma_s": 0,
-                "fund_vol": 1e-3,
+                "fund_vol": fund_vol,
                 "megashock_lambda_a": 2.77778e-18,
                 "megashock_mean": 1000,
                 "megashock_var": 50_000,
@@ -106,8 +120,13 @@ def build_market_config(
     ]
     agent_count = 1
 
-    noise_mkt_open = historical_date + str_to_ns("09:00:00")
-    noise_mkt_close = historical_date + str_to_ns("16:00:00")
+    # NOTE: previously hardcoded to "09:00:00"-"16:00:00" regardless of start_time/
+    # end_time -- harmless for a full 6.5-hour session, but for a short (e.g. 30-60
+    # min) training episode it meant only a tiny fraction of num_noise_agents ever
+    # woke up inside the window, giving unrealistically thin liquidity. Scale to the
+    # actual session instead.
+    noise_mkt_open = mkt_open - str_to_ns(noise_warmup)
+    noise_mkt_close = mkt_close
     agents += [
         NoiseAgent(
             id=j,

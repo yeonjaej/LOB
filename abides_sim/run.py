@@ -176,13 +176,20 @@ def run_execution_sim(
         if shares == 0:
             continue
         avg_price = float((sf["price"] * sf["qty"]).sum() / shares) / 100.0  # cents -> dollars
-        contemporaneous_mid = mid_at(exec_mid, int(srow["time"])) / 100.0
+        # Use the slice's own *actual fill* time, not its scheduled wake time, to look up
+        # the contemporaneous mid: network/computation latency means fills land a few ms
+        # to a few tens of ms after the wake-up call that triggers them, and "nearest"
+        # against the scheduled time can otherwise grab a stale pre-fill snapshot (this is
+        # exactly what silently zeroed out naive's market-impact reading below, before the
+        # fix -- see Part 2b/3b discussion).
+        fill_time = int(sf["time"].min())
+        contemporaneous_mid = mid_at(exec_mid, fill_time) / 100.0
         total_cost += avg_price * shares
         total_filled += shares
         records.append(
             {
                 "trade_num": int(srow["slice_num"]),
-                "time_ns": int(srow["time"]),
+                "time_ns": fill_time,
                 "shares": shares,
                 "avg_fill_price": avg_price,
                 "contemporaneous_mid": contemporaneous_mid,
@@ -201,10 +208,20 @@ def run_execution_sim(
     vs_benchmark_bps = vs_benchmark_dollars / benchmark_price * 10_000
 
     # --- market impact: exec-run mid vs. baseline mid, same seed, over the exec window ---
-    exec_window_end = int(slices["time"].max()) if len(slices) else trade_end_ns
-    grid = np.linspace(trade_start_ns, exec_window_end, 200).astype("int64")
-    exec_path = np.array([mid_at(exec_mid, t) for t in grid])
-    base_path = np.array([mid_at(baseline_mid, t) for t in grid])
+    # Anchored to the *actual* first/last fill times, not the scheduled wake times: for a
+    # single-shot naive order in particular, the scheduled time is pre-trade (network/
+    # computation latency delays the fill by ~10-20ms), so measuring impact "at" the
+    # scheduled instant silently grabs the same pre-trade snapshot in both the baseline and
+    # execution runs -- a real bug that showed up as an exact 0.00 impact reading for naive
+    # regardless of trade size (diagnosed via the raw L1 snapshot timestamps around a fill).
+    if len(fills):
+        impact_start_ns = int(fills["time"].min())
+        impact_end_ns = int(fills["time"].max())
+    else:
+        impact_start_ns, impact_end_ns = trade_start_ns, trade_end_ns
+    grid = np.linspace(impact_start_ns, impact_end_ns, 200).astype("int64")
+    exec_path = mid_at_many(exec_mid, grid)
+    base_path = mid_at_many(baseline_mid, grid)
     impact_bps_series = (exec_path - base_path) / base_path * 10_000
     impact_bps_avg = float(np.mean(impact_bps_series))
     impact_bps_end = float(impact_bps_series[-1])

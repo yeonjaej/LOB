@@ -61,7 +61,11 @@ class ScheduledExecutionAgent(TradingAgent):
         self.symbol = symbol
         self.direction = direction
         self.total_shares = total_shares
-        self.remaining = total_shares
+        # `remaining` is a derived property (see below), not a mutable field -- see
+        # the matching fix/comment on RLExecutionAgent.remaining in gym_env.py for
+        # why decrementing at request time (the previous design here too) silently
+        # masks partial-fill shortfalls instead of reporting them.
+        self.total_filled = 0
 
         if mode in ("naive", "twap"):
             self.schedule: List[NanosecondTime] = sorted(schedule)
@@ -92,13 +96,25 @@ class ScheduledExecutionAgent(TradingAgent):
         # Wake right at market open; wakeup() itself defers to the real schedule.
         return 0
 
+    @property
+    def remaining(self) -> int:
+        return max(0, self.total_shares - self.total_filled)
+
     # ---- fill tracking -------------------------------------------------
     def order_executed(self, order) -> None:
         super().order_executed(order)
         self.fills.append((self.current_time, order.fill_price, order.quantity))
+        self.total_filled += order.quantity
 
     # ---- naive / twap: no round-trip needed -----------------------------
     def _place_next_slice(self, current_time: NanosecondTime) -> None:
+        # slice_sizes are precomputed (build_slice_sizes) to sum to exactly
+        # total_shares and are disjoint per-slice allocations -- unlike
+        # RLExecutionAgent's same-call chosen+forced pair, multiple slices placed
+        # in this same while-loop (if several scheduled times are simultaneously
+        # due) never double-request the same shares, so no within-call remaining
+        # tracking is needed here; self.remaining only needs to reflect confirmed
+        # fills for reporting/guard purposes.
         while self.schedule and current_time >= self.schedule[0]:
             self.schedule.pop(0)
             size = self.slice_sizes.pop(0)
@@ -106,7 +122,6 @@ class ScheduledExecutionAgent(TradingAgent):
                 size = min(size, self.remaining)
                 self.place_market_order(self.symbol, size, self.direction)
                 self.slice_log.append((current_time, size))
-                self.remaining -= size
 
         if self.schedule:
             self.set_wakeup(self.schedule[0])
@@ -121,7 +136,6 @@ class ScheduledExecutionAgent(TradingAgent):
         if size > 0:
             self.place_market_order(self.symbol, size, self.direction)
             self.slice_log.append((self.current_time, size))
-            self.remaining -= size
         self.state = "AWAITING_WAKEUP"
         next_wake = self.current_time + self.pov_wake_freq_ns
         stop_time = self.end_time if self.end_time is not None else self.mkt_close
