@@ -1,0 +1,17 @@
+*.csv
+*.ipynb_checkpoints
+*.zip
+log/**
+data/.cache
+data/log/**
+abides_sim/__pycache__
+*.bak
+*.pdf
+*.pkl
+data/ppo_recal_sweep_phi_0.05
+data/ppo_recal_sweep_phi_0.1
+data/ppo_recal_sweep_phi_0.2
+data/ppo_sweep_phi_0.05
+data/ppo_sweep_phi_0.1
+data/ppo_sweep_phi_0.2
+data/tb_logs
