@@ -19,35 +19,22 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from abides_core import abides
 from abides_core.utils import str_to_ns, datetime_str_to_ns
 
-from .config import build_market_config
+from .config import run_market
 from .agents import ScheduledExecutionAgent
-from .gym_env import ABIDESExecutionEnv, pick_window
+from .gym_env import ABIDESExecutionEnv, pick_window, MAX_ACTION_FRAC
 from .run import mid_price_path, mid_at
 
 BENCHMARK_SEEDS = list(range(1, 31))  # disjoint from oracle_train's seeds 300-349
 HISTORICAL_DATE_NS = datetime_str_to_ns("20250101")
 
 
-def _fresh_run(seed, start_time, end_time, exec_agent_builder, symbol="ABM", **market_kwargs):
-    """Builds config + Kernel entirely from scratch every call -- never reuses or
-    deepcopies a partially-run Kernel -- so a given seed guarantees bit-identical
-    pre-trade background state across every candidate evaluated against it."""
-    config = build_market_config(
-        seed=seed, symbol=symbol, start_time=start_time, end_time=end_time,
-        exec_agent_builder=exec_agent_builder, **market_kwargs,
-    )
-    end_state = abides.run(config)
-    return config, end_state
-
-
 def run_baseline(seed: int, window_minutes: int = 45, symbol: str = "ABM", **market_kwargs) -> dict:
     start_time, end_time = pick_window(seed, window_minutes)
     mkt_open_ns = HISTORICAL_DATE_NS + str_to_ns(start_time)
     mkt_close_ns = HISTORICAL_DATE_NS + str_to_ns(end_time)
-    config, end_state = _fresh_run(seed, start_time, end_time, None, symbol=symbol, **market_kwargs)
+    config, end_state = run_market(seed, start_time, end_time, None, symbol=symbol, **market_kwargs)
     mid_df = mid_price_path(end_state["agents"][0].order_books[symbol], symbol)
     return {
         "start_time": start_time,
@@ -121,7 +108,7 @@ def run_scheduled(
                 log_orders=True,
             )
 
-    config, end_state = _fresh_run(seed, start_time, end_time, build_exec_agent, symbol=symbol, **market_kwargs)
+    config, end_state = run_market(seed, start_time, end_time, build_exec_agent, symbol=symbol, **market_kwargs)
     exec_agent = config["agents"][-1]
     exec_mid = mid_price_path(end_state["agents"][0].order_books[symbol], symbol)
     return _summarize(exec_agent.fills, exec_mid, baseline, total_shares)
@@ -131,6 +118,8 @@ def run_ppo(
     seed: int, model, oracle_predict_fn: Optional[callable], baseline: dict,
     total_shares: int = 10_000, horizon_steps: int = 40, window_minutes: int = 45,
     step_interval: str = "1min", symbol: str = "ABM", phi: float = 0.03, psi: float = 1.0,
+    action_shares: Optional[dict] = None, continuous_action: bool = False,
+    max_action_frac: float = MAX_ACTION_FRAC, extended_obs: bool = False,
     **market_kwargs,
 ) -> dict:
     """Evaluates a trained PPO policy deterministically. Hyperparameters
@@ -171,10 +160,22 @@ def run_ppo(
     back down late in with-oracle's training, worse than its own mid-training peak, so
     trusting the final checkpoint would have picked a worse policy. This brought
     impact_bps down to ~TWAP-level (from ~10-16bps at phi=0.1 down to roughly 0bps).
+
+    action_shares (v2): same class of bug as phi/psi above -- ABIDESExecutionEnv's own
+    constructor arg, not a market_kwarg, so it must be named explicitly here too rather
+    than falling into **market_kwargs (build_market_config doesn't accept it either).
+    None (default) preserves DEFAULT_ACTION_SHARES for v0/v1 checkpoints; pass
+    FINE_ACTION_SHARES (gym_env.py) for v2 checkpoints trained with the finer grid.
+
+    continuous_action (v3): same explicit-parameter treatment, added proactively
+    this time rather than after a crash -- see ABIDESExecutionEnv's own constructor.
+    False (default) preserves discrete behavior for every prior version's checkpoint.
     """
     env = ABIDESExecutionEnv(
         total_shares=total_shares, horizon_steps=horizon_steps, window_minutes=window_minutes,
         step_interval=step_interval, oracle_predict_fn=oracle_predict_fn, phi=phi, psi=psi,
+        action_shares=action_shares, continuous_action=continuous_action,
+        max_action_frac=max_action_frac, extended_obs=extended_obs,
         market_kwargs=dict(symbol=symbol, **market_kwargs),
     )
     obs, _ = env.reset(seed=seed)
@@ -190,6 +191,8 @@ def run_ppo(
 def _run_one_seed(
     seed: int, model_no_oracle_path: str, model_with_oracle_path: str,
     oracle_predict_fn: Optional[callable], market_kwargs: dict,
+    action_shares: Optional[dict] = None, continuous_action: bool = False,
+    max_action_frac: float = MAX_ACTION_FRAC, extended_obs: bool = False,
 ) -> list:
     """One seed's full bundle (baseline + all 5 candidates) -- the unit of work handed
     to each ProcessPoolExecutor worker. Loads the PPO models from disk inside the
@@ -197,7 +200,14 @@ def _run_one_seed(
     around SB3's internal device/optimizer state when passed across a process
     boundary; loading fresh per-worker is cheap relative to the simulation cost it
     runs alongside. oracle_predict_fn (an `OraclePredictor` instance) IS passed
-    directly -- it was deliberately built as a plain, picklable, module-level class."""
+    directly -- it was deliberately built as a plain, picklable, module-level class.
+
+    action_shares (v2) is routed only into the two run_ppo() calls below, not
+    run_baseline/run_scheduled -- same class of bug as phi/psi/horizon_steps before
+    it: it's an ABIDESExecutionEnv constructor arg, not a market_kwarg, and
+    build_market_config (which run_baseline/run_scheduled eventually call) doesn't
+    accept it. Passing it through market_kwargs uniformly to every candidate, the way
+    this function's other **market_kwargs already work, would break naive/TWAP/POV."""
     from stable_baselines3 import PPO
 
     model_no_oracle = PPO.load(model_no_oracle_path)
@@ -207,8 +217,8 @@ def _run_one_seed(
         "Naive": run_scheduled(seed, "naive", baseline, **market_kwargs),
         "TWAP": run_scheduled(seed, "twap", baseline, **market_kwargs),
         "POV": run_scheduled(seed, "pov", baseline, **market_kwargs),
-        "PPO (no oracle)": run_ppo(seed, model_no_oracle, None, baseline, **market_kwargs),
-        "PPO (with oracle)": run_ppo(seed, model_with_oracle, oracle_predict_fn, baseline, **market_kwargs),
+        "PPO (no oracle)": run_ppo(seed, model_no_oracle, None, baseline, action_shares=action_shares, continuous_action=continuous_action, max_action_frac=max_action_frac, extended_obs=extended_obs, **market_kwargs),
+        "PPO (with oracle)": run_ppo(seed, model_with_oracle, oracle_predict_fn, baseline, action_shares=action_shares, continuous_action=continuous_action, max_action_frac=max_action_frac, extended_obs=extended_obs, **market_kwargs),
     }
     print(f"seed {seed} done: " + ", ".join(f"{k}={v['IS_bps']:+.1f}bps" for k, v in candidates.items()))
     return [{"seed": seed, "method": label, **res} for label, res in candidates.items()]
@@ -216,7 +226,9 @@ def _run_one_seed(
 
 def run_benchmark(
     model_no_oracle_path: str, model_with_oracle_path: str, oracle_predict_fn,
-    seeds=BENCHMARK_SEEDS, n_workers: Optional[int] = None, **market_kwargs,
+    seeds=BENCHMARK_SEEDS, n_workers: Optional[int] = None,
+    action_shares: Optional[dict] = None, continuous_action: bool = False,
+    max_action_frac: float = MAX_ACTION_FRAC, extended_obs: bool = False, **market_kwargs,
 ) -> pd.DataFrame:
     """Each of the 30 (by default) seeds is an independent full-window bundle (one
     shared baseline run + 5 candidate runs), so seeds are farmed out across a process
@@ -224,6 +236,11 @@ def run_benchmark(
     already used for the oracle's data generation.
 
     NOTE: takes model *paths* (strings), not live PPO objects -- see `_run_one_seed`.
+    action_shares: explicit (not **market_kwargs) for the same reason phi/psi/
+    horizon_steps are -- see run_ppo's and _run_one_seed's docstrings. None (default)
+    preserves DEFAULT_ACTION_SHARES for v0/v1 checkpoints; pass FINE_ACTION_SHARES
+    (gym_env.py) for v2 checkpoints. continuous_action: same treatment, for v3
+    checkpoints trained with ABIDESExecutionEnv(continuous_action=True).
     """
     assert set(seeds).isdisjoint(range(300, 350)), "benchmark seeds overlap the oracle's training seeds"
     n_workers = min(n_workers or max(1, (os.cpu_count() or 2) - 1), len(seeds))
@@ -231,6 +248,8 @@ def run_benchmark(
         _run_one_seed, model_no_oracle_path=model_no_oracle_path,
         model_with_oracle_path=model_with_oracle_path,
         oracle_predict_fn=oracle_predict_fn, market_kwargs=market_kwargs,
+        action_shares=action_shares, continuous_action=continuous_action,
+        max_action_frac=max_action_frac, extended_obs=extended_obs,
     )
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         results = list(pool.map(worker_fn, seeds))

@@ -7,7 +7,7 @@ Feature set matches `ORACLE_FEATURE_COLS` in `gym_env.py`: obi_l1, obi_l5,
 relative_depth_l5, spread_bps, micro_price_deviation_bps, momentum at 10s/60s/300s,
 ΔOBI over 10s, and 60s realized vol. `RLExecutionAgent` now subscribes at L2 depth=5
 and maintains a rolling tick buffer specifically so it can compute this same feature
-set live (see `gym_env.py`'s `_oracle_features`/`history_features`) -- this function
+set live (see `gym_env.py`'s `_market_state`/`history_features`) -- this function
 reconstructs the identical features offline from a completed episode's full per-event
 book history, so train and serve see the same information.
 """
@@ -282,8 +282,8 @@ class OraclePredictor:
         self.ct = ct
 
     def __call__(self, features: np.ndarray) -> float:
-        # features: RLExecutionAgent._oracle_features's 10-vector, already built in
-        # ORACLE_FEATURE_COLS order -- no reordering needed (a prior 3-feature version
-        # manually reordered here, which was itself a latent bug risk).
+        # features: the ORACLE_FEATURE_COLS-ordered 10-vector RLExecutionAgent._build_obs
+        # pulls out of _market_state(), already in this order -- no reordering needed
+        # (a prior 3-feature version manually reordered here, itself a latent bug risk).
         x = np.asarray(features, dtype=np.float64).reshape(1, -1)
         return float(self.model.predict(self.ct.transform(x))[0])

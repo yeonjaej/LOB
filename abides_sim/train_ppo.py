@@ -85,6 +85,8 @@ def train_ppo_agent(
     run_name: Optional[str] = None,
     n_envs: int = 1,
     snapshot_every: Optional[int] = None,
+    ent_coef: float = 0.0,
+    gamma: float = 1.0,
 ) -> PPO:
     # oracle_predict_fn (if used) goes through env_kwargs, not a separate top-level
     # parameter -- a prior version had both, which crashed with a duplicate-keyword
@@ -116,9 +118,26 @@ def train_ppo_agent(
     # coarser. Floor of 32 keeps enough per-env diversity in one rollout batch.
     n_steps = max(256 // n_envs, 32)
     batch_size = 64 if (n_steps * n_envs) % 64 == 0 else n_steps * n_envs
+    # ent_coef=0.0 (SB3's own default) means no entropy bonus counteracts a policy's
+    # natural tendency to narrow toward whatever actions early rollouts mildly favor --
+    # v2.1 tests whether that's actually starving out genuinely-useful actions
+    # (checked directly: v0/v1/v2's entropy_loss trajectories all decline smoothly then
+    # plateau well before training ends, consistent with unchallenged narrowing, not
+    # sudden pathological collapse).
+    #
+    # gamma=1.0, not SB3's own 0.99 default (v3.1): the episode horizon is short and
+    # strictly finite (horizon_steps decisions, no risk of an unbounded sum), so there's
+    # no need for a discount to keep returns bounded -- the usual reason gamma<1 exists.
+    # Checked directly before changing it: recomputing v3's saved per-step trajectories'
+    # totals under gamma=0.99 shrinks the trained policy's loss by ~30% vs. ~13% for a
+    # uniform/TWAP-like schedule, but the gap barely closes (-7.41 vs. -1.20) -- not
+    # nearly enough to make procrastination actually reward-optimal under discounting,
+    # so this isn't expected to fix v3's collapse by itself, just removes a real (if
+    # secondary) distortion between the critic's objective and true implementation
+    # shortfall, standard practice for finite-horizon execution RL.
     model = PPO(
         "MlpPolicy", vec_env, n_steps=n_steps, batch_size=batch_size, verbose=1, seed=seed,
-        tensorboard_log=tensorboard_log,
+        tensorboard_log=tensorboard_log, ent_coef=ent_coef, gamma=gamma,
     )
     callback = EpisodeProgressCallback(
         target_episodes=target_episodes, checkpoint_path=checkpoint_path, snapshot_every=snapshot_every,

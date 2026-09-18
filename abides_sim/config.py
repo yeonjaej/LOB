@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
+from abides_core import abides
 from abides_core.utils import str_to_ns, datetime_str_to_ns, get_wake_time
 from abides_markets.agents import (
     ExchangeAgent,
@@ -219,3 +220,22 @@ def build_market_config(
         "mkt_open": mkt_open,
         "mkt_close": mkt_close,
     }
+
+
+def run_market(seed, start_time, end_time, exec_agent_builder, symbol="ABM", **market_kwargs):
+    """Builds config + Kernel entirely from scratch every call -- never reuses or
+    deepcopies a partially-run Kernel -- so a given seed guarantees bit-identical
+    pre-trade background state across every candidate evaluated against it. Moved
+    here from `benchmark.py` (where it was `_fresh_run`, module-private) so
+    `gym_env.py` can also use it, for the same seed-matched-baseline pattern, to build
+    a no-execution-agent reference price path for the reward -- `gym_env.py` already
+    exports `pick_window` for `benchmark.py` to import, so importing the reverse
+    direction (`gym_env.py` importing FROM `benchmark.py`) would be circular; this
+    function's only real dependency is `build_market_config`, right above, so it
+    belongs here instead."""
+    config = build_market_config(
+        seed=seed, symbol=symbol, start_time=start_time, end_time=end_time,
+        exec_agent_builder=exec_agent_builder, **market_kwargs,
+    )
+    end_state = abides.run(config)
+    return config, end_state
